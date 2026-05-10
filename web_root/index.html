@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>我的网页宠物</title>
+<style>
+  :root {
+    --bg: #fef6e4;
+    --card: #fffaf0;
+    --ink: #001858;
+    --accent: #f582ae;
+    --good: #8bd3dd;
+    --warn: #f3d2c1;
+    --bad: #ef6f6c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  .card {
+    background: var(--card);
+    padding: 32px 36px;
+    border-radius: 24px;
+    box-shadow: 0 12px 40px rgba(0,24,88,0.12);
+    width: min(420px, 92vw);
+    text-align: center;
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 22px;
+  }
+  .subtitle {
+    margin: 0 0 20px;
+    color: #6b6b8a;
+    font-size: 13px;
+  }
+  .pet {
+    font-size: 96px;
+    line-height: 1;
+    user-select: none;
+    display: inline-block;
+    transition: transform 0.25s ease;
+    animation: idle 2.6s ease-in-out infinite;
+  }
+  .pet.eating { animation: eat 0.6s ease; }
+  .pet.sad { filter: grayscale(0.4) brightness(0.95); }
+  @keyframes idle {
+    0%, 100% { transform: translateY(0) rotate(0); }
+    50% { transform: translateY(-6px) rotate(-2deg); }
+  }
+  @keyframes eat {
+    0% { transform: scale(1); }
+    40% { transform: scale(1.18) rotate(8deg); }
+    70% { transform: scale(0.95) rotate(-4deg); }
+    100% { transform: scale(1); }
+  }
+  .mood-line {
+    margin: 8px 0 18px;
+    font-size: 14px;
+    color: #444;
+    min-height: 1.2em;
+  }
+  .bars { text-align: left; margin: 16px 0; }
+  .bar {
+    margin: 10px 0;
+  }
+  .bar-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .bar-track {
+    height: 12px;
+    background: #ececf2;
+    border-radius: 999px;
+    overflow: hidden;
+  }
+  .bar-fill {
+    height: 100%;
+    border-radius: 999px;
+    transition: width 0.4s ease, background-color 0.4s ease;
+  }
+  button {
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 12px 28px;
+    font-size: 16px;
+    font-weight: 600;
+    border-radius: 999px;
+    cursor: pointer;
+    box-shadow: 0 6px 16px rgba(245,130,174,0.4);
+    transition: transform 0.1s ease, box-shadow 0.1s ease;
+  }
+  button:hover { transform: translateY(-2px); }
+  button:active { transform: translateY(0); box-shadow: 0 3px 8px rgba(245,130,174,0.4); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+  .footer {
+    margin-top: 14px;
+    font-size: 11px;
+    color: #999;
+  }
+  .crumbs {
+    position: absolute;
+    pointer-events: none;
+    font-size: 24px;
+    animation: crumb 0.7s ease-out forwards;
+  }
+  @keyframes crumb {
+    0% { opacity: 1; transform: translate(0,0) scale(1); }
+    100% { opacity: 0; transform: translate(var(--dx), 60px) scale(0.5); }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>我的网页宠物</h1>
+    <p class="subtitle">点按钮喂它，不然它会饿哦</p>
+    <div style="position: relative; display: inline-block;">
+      <div id="pet" class="pet">🐱</div>
+    </div>
+    <div id="mood" class="mood-line">…</div>
+
+    <div class="bars">
+      <div class="bar">
+        <div class="bar-label"><span>饥饿度</span><span id="hunger-val">0</span></div>
+        <div class="bar-track"><div id="hunger-bar" class="bar-fill" style="background: var(--bad);"></div></div>
+      </div>
+      <div class="bar">
+        <div class="bar-label"><span>心情</span><span id="happy-val">0</span></div>
+        <div class="bar-track"><div id="happy-bar" class="bar-fill" style="background: var(--good);"></div></div>
+      </div>
+    </div>
+
+    <button id="feed-btn">🍖 喂食</button>
+    <div class="footer">已喂食 <span id="feed-count">0</span> 次</div>
+  </div>
+
+<script>
+const petEl = document.getElementById('pet');
+const moodEl = document.getElementById('mood');
+const hungerBar = document.getElementById('hunger-bar');
+const happyBar = document.getElementById('happy-bar');
+const hungerVal = document.getElementById('hunger-val');
+const happyVal = document.getElementById('happy-val');
+const feedCount = document.getElementById('feed-count');
+const feedBtn = document.getElementById('feed-btn');
+
+const moodMap = {
+  starving: { emoji: '🙀', text: '饿坏了！快喂我！', sad: true },
+  hungry:   { emoji: '😿', text: '有点饿了…',         sad: true },
+  ok:       { emoji: '🐱', text: '一切都好',           sad: false },
+  happy:    { emoji: '😻', text: '心情超棒！',         sad: false },
+  sad:      { emoji: '😾', text: '不太开心…',          sad: true },
+};
+
+function render(state) {
+  const m = moodMap[state.mood] || moodMap.ok;
+  petEl.textContent = m.emoji;
+  petEl.classList.toggle('sad', m.sad);
+  moodEl.textContent = m.text;
+
+  const h = Math.round(state.hunger);
+  const p = Math.round(state.happiness);
+  hungerVal.textContent = h;
+  happyVal.textContent = p;
+  hungerBar.style.width = h + '%';
+  happyBar.style.width = p + '%';
+  hungerBar.style.background = h > 60 ? 'var(--bad)' : (h > 30 ? 'var(--warn)' : 'var(--good)');
+  feedCount.textContent = state.feed_count;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/pet');
+    if (r.ok) render(await r.json());
+  } catch (e) { /* ignore */ }
+}
+
+async function feed() {
+  feedBtn.disabled = true;
+  petEl.classList.remove('eating');
+  void petEl.offsetWidth;
+  petEl.classList.add('eating');
+  spawnCrumbs();
+  try {
+    const r = await fetch('/api/feed', { method: 'POST' });
+    if (r.ok) render(await r.json());
+  } catch (e) { /* ignore */ }
+  setTimeout(() => { feedBtn.disabled = false; }, 500);
+}
+
+function spawnCrumbs() {
+  const rect = petEl.getBoundingClientRect();
+  for (let i = 0; i < 4; i++) {
+    const c = document.createElement('div');
+    c.className = 'crumbs';
+    c.textContent = '🍖';
+    c.style.left = (rect.left + rect.width / 2 - 12) + 'px';
+    c.style.top = (rect.top + rect.height / 2) + 'px';
+    c.style.setProperty('--dx', (Math.random() * 80 - 40) + 'px');
+    document.body.appendChild(c);
+    setTimeout(() => c.remove(), 800);
+  }
+}
+
+feedBtn.addEventListener('click', feed);
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
