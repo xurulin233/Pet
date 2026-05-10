@@ -1,12 +1,11 @@
 PROG ?= pet
-SOURCES = main.c mongoose.c
+SOURCES = main.c ini.c mongoose.c
 CFLAGS = -W -Wall -Wextra -O2 -g -I.
 LDLIBS = -lm
 
 all: $(PROG)
-	./$(PROG)
 
-$(PROG): $(SOURCES) mongoose.h
+$(PROG): $(SOURCES) mongoose.h ini.h
 	$(CC) $(SOURCES) $(CFLAGS) -o $(PROG) $(LDLIBS)
 
 clean:

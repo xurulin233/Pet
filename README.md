@@ -17,7 +17,6 @@
 ### 1.2 非目标
 
 - 不做账户系统、多宠物、跨用户隔离（全局只有一只宠物，所有访问者看到的是同一只）。
-- 不做状态持久化（重启后宠物状态归零）。
 - 不做 HTTPS / 鉴权 / 限流。
 
 ---
@@ -77,11 +76,14 @@
 
 ```
 tutorials/http/pet/
-├── main.c              ← 后端：宠物逻辑 + HTTP 路由
+├── main.c              ← 后端：宠物逻辑 + HTTP 路由 + 配置加载/保存
+├── ini.c               ← INI 配置文件解析器（可独立复用，不依赖 mongoose）
+├── ini.h               ← INI 解析器接口
 ├── Makefile            ← 编译脚本
 ├── mongoose.c          ← Mongoose 库源码（项目自带，独立可移植）
 ├── mongoose.h          ← 同上
 ├── pet                 ← 编译产物：可执行文件（make clean 会删除）
+├── pet.ini             ← 运行时生成：宠物状态持久化文件（可选）
 └── web_root/
     └── index.html      ← 前端单页面（HTML + CSS + JS 全部内联）
 ```
@@ -230,6 +232,151 @@ mg_mgr_free(&mgr);
 - `mg_mgr_poll(&mgr, 1000)`：阻塞最多 1 秒；有网络事件就立即返回并触发回调。
 - `s_signo` 由 `signal_handler` 设置，Ctrl+C / SIGTERM 时优雅退出。
 
+### 5.7 配置文件 (INI 持久化)
+
+启动时通过 `-c <path>` 指定配置文件路径。如果路径不存在，使用默认值；存在则把宠物状态读回内存。优雅退出（Ctrl+C 或 SIGTERM）时把当前状态写回该文件。
+
+**INI 解析器设计（`ini.c` / `ini.h`）**
+
+解析器是一个纯 C 模块，**不依赖 mongoose**，可独立复用：
+
+```c
+typedef int (*ini_handler_t)(const char *section, const char *key,
+                             const char *value, void *user_data);
+
+int ini_load(const char *path, ini_handler_t handler, void *user_data);
+```
+
+调用方式：传一个回调，对每个解析到的 `key=value` 调一次。回调返回 0 继续解析，非 0 短路退出。
+
+**支持的语法：**
+
+```ini
+; 行注释（分号或井号）
+# 也可以
+[section]
+key = value     ; 行尾注释也支持
+```
+
+**特性 / 取舍：**
+- 容忍 `key`、`value`、`section` 周围的任意空白
+- 行长度上限 `INI_LINE_MAX` (1024)，所有解析在栈上完成，**零堆分配**
+- 不支持引号字符串、转义、多行值
+- 没有 `[section]` 就出现的键值对会被静默丢弃（避免歧义）
+- 出错策略：格式异常的行直接跳过，不会让整个解析失败
+
+**实现细节：**
+
+整个解析器只有一个外部函数 `ini_load`，加两个文件作用域辅助函数 `strip` / `strip_inline_comment`，约 50 行代码。核心思路是 **逐行读取 + 原地切片**（in-place tokenization）：把 `fgets` 读到的行 buffer 当成可变字符串，在上面写入 `'\0'` 把它切成几段，把指针交给回调。这样不需要额外内存。
+
+```
+原始行:   "  hunger  =  30.0  ; comment\n"
+
+第 1 步 strip_inline_comment:
+          "  hunger  =  30.0  "         ← ';' 处直接置 '\0'
+
+第 2 步 strip (整行去首尾空白):
+          "hunger  =  30.0"             ← 末尾空白置 '\0'，返回首个非空白指针
+
+第 3 步 在 '=' 处置 '\0' 切两半:
+          "hunger  \0  30.0"
+            ↑          ↑
+           key 起点    value 起点（再各自 strip）
+
+第 4 步 各自 strip:
+          key   = "hunger"
+          value = "30.0"
+```
+
+**逐行处理流程**（`ini_load` 主循环）：
+
+```c
+char line[INI_LINE_MAX];
+char section[128] = "";
+
+while (fgets(line, sizeof(line), fp)) {
+  strip_inline_comment(line);           // 1. 去掉 ';' 或 '#' 之后的内容
+  char *trimmed = strip(line);          // 2. 整行去首尾空白
+  if (*trimmed == '\0') continue;       // 3. 空行跳过
+
+  if (*trimmed == '[') {                // 4. section 头
+    char *end = strchr(trimmed, ']');
+    if (!end) continue;                 //    缺右括号 → 静默忽略
+    *end = '\0';
+    snprintf(section, sizeof section, "%s", strip(trimmed + 1));
+    continue;
+  }
+
+  char *eq = strchr(trimmed, '=');      // 5. key=value
+  if (!eq) continue;                    //    没 '=' → 静默忽略
+  *eq = '\0';
+  char *key = strip(trimmed);
+  char *value = strip(eq + 1);
+
+  if (*key == '\0' || *section == '\0') continue;
+  if (handler(section, key, value, user_data) != 0) break;  // 6. 短路退出
+}
+```
+
+**关键设计点：**
+
+| 点 | 为什么这么做 |
+|---|---|
+| 用 `fgets` 而不是一次性读整个文件 | 不知道文件有多大，避免无界堆分配；同时天然处理跨平台换行（`\r\n` 也能读完一行） |
+| 行 buffer 复用 + 原地切片 | 每行所有 token（section、key、value）共用同一块栈内存，只是各自指向中间不同位置 |
+| 回调传出的指针生命周期 | 指针只在该次回调期间有效；下一行 `fgets` 会覆盖 buffer。**回调里要用就 `strcpy`/`atof` 立刻消费**，不能存指针 |
+| `strip` 同时调整左右两端 | 通过移动起点指针 + 在末尾置 `'\0'` 实现，**O(行长)**，没有第二个 buffer |
+| 注释优先于 `=` 解析 | `key = a;b` 中 `;b` 是注释，先去注释保证 value 不被污染 |
+| `section` 缓冲区 128 字节 | 固定大小数组，section 名超过 127 字符会被 `snprintf` 安全截断（不溢出，但截掉的部分丢失） |
+| 容错策略 | 异常行（缺 `]`、缺 `=`、空 key）一律 `continue`。这样配置文件被手工编辑出小错也不会让整个加载失败 |
+
+**复杂度：**
+
+- 时间 **O(N)**，N = 文件总字符数。每个字符最多被扫两次（`strip` 一次、`strchr` / `strlen` 一次）。
+- 空间 **O(1)**，只有两个固定大小的栈缓冲：`line[1024]` + `section[128]`。
+
+**线程安全：**
+
+`ini_load` 本身用的全是局部变量和栈缓冲，**多线程同时解析不同文件没问题**。但回调里如果写共享状态（像 `main.c` 里的 `s_pet`），调用方需要自己加锁。本项目单线程事件循环，无此问题。
+
+**main.c 的接入方式：**
+
+```c
+static int load_handler(const char *section, const char *key,
+                        const char *value, void *ud) {
+  if (strcmp(section, "pet") != 0) return 0;
+  if (strcmp(key, "hunger") == 0)         s_pet.hunger     = atof(value);
+  else if (strcmp(key, "happiness") == 0) s_pet.happiness  = atof(value);
+  else if (strcmp(key, "feed_count") == 0) s_pet.feed_count = atoll(value);
+  return 0;
+}
+```
+
+保存则直接 `fopen + fprintf`，因为只有几行，不需要专门的写入器：
+
+```ini
+; Web pet state. Auto-saved on shutdown.
+[pet]
+hunger     = 0.0018
+happiness  = 99.9955
+feed_count = 5
+```
+
+**生命周期：**
+
+```
+启动 ──► load_config ──► s_pet 填充
+                          │
+                          ▼
+                       事件循环
+                          │
+            SIGINT/SIGTERM
+                          ▼
+                     save_config ──► 写回 .ini ──► 退出
+```
+
+注意：保存只发生在**优雅退出**路径上。`kill -9` 或断电不会触发保存。如果需要更强的持久化，可改成定时落盘（每 N 秒或每次 feed 后写入）。
+
 ---
 
 ## 6. HTTP API
@@ -348,14 +495,13 @@ const moodMap = {
 
 ```makefile
 PROG ?= pet
-SOURCES = main.c mongoose.c
+SOURCES = main.c ini.c mongoose.c
 CFLAGS = -W -Wall -Wextra -O2 -g -I.
 LDLIBS = -lm
 
 all: $(PROG)
-	./$(PROG)
 
-$(PROG): $(SOURCES) mongoose.h
+$(PROG): $(SOURCES) mongoose.h ini.h
 	$(CC) $(SOURCES) $(CFLAGS) -o $(PROG) $(LDLIBS)
 
 clean:
@@ -373,10 +519,8 @@ clean:
 
 ```bash
 cd tutorials/http/pet
-make           # 编译并启动 (默认 target 会跑 ./pet)
-# 或:
-make pet
-./pet
+make           # 编译，产物为 ./pet
+./pet          # 启动服务器
 ```
 
 监听 `0.0.0.0:8000`，所有网卡都接受连接。浏览器打开：
@@ -384,6 +528,23 @@ make pet
 ```
 http://localhost:8000           # 本机
 http://192.168.x.x:8000         # 同网段其它设备
+```
+
+**命令行参数：**
+
+| 参数 | 说明 | 默认 |
+|---|---|---|
+| `-c PATH` | INI 配置文件路径，启动时读、退出时写 | 不持久化 |
+| `-l ADDR` | 监听地址 | `http://0.0.0.0:8000` |
+| `-d DIR`  | 静态文件根目录 | `web_root` |
+
+启用持久化运行：
+
+```bash
+./pet -c pet.ini
+# 喂食…
+# Ctrl+C 退出，状态自动保存到 pet.ini
+./pet -c pet.ini   # 再次启动，宠物从上次状态恢复
 ```
 
 ### 8.3 防火墙提示
@@ -433,7 +594,7 @@ sudo ufw allow 8000/tcp
 按工作量从小到大：
 
 1. **限制 method**：用 `mg_strcmp(hm->method, mg_str("POST"))` 让 `/api/feed` 只接受 POST。
-2. **状态持久化**：宠物状态 `fwrite` 到 `pet_state.bin`，启动时 `fread` 回来。
+2. **定时落盘**：当前只在退出时保存状态，可改成每 N 秒或每次 feed 后写入 `pet.ini`，避免 `kill -9` 丢数据。
 3. **增加交互**：陪玩按钮（提升 happiness 但不影响 hunger）、洗澡按钮（解锁 happy 上限）。
 4. **多宠物**：根据 cookie 或 URL 参数 `?id=xxx` 维护一个 `map<id, pet>`，每人一只。
 5. **WebSocket 推送**：用 mongoose 的 `mg_ws_*` API 做服务端推送，去掉前端轮询。
